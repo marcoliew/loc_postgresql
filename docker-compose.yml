@@ -1,38 +1,180 @@
-version: '3.8'
-
 services:
-  postgres:
-    image: postgres:latest
-    container_name: loc-postgres
+  postgres-primary:
+    image: postgis/postgis:latest
+    container_name: pg-primary
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: secret
+      #POSTGRES_PASSWORD: secret
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password  # Secure password injection
       POSTGRES_DB: testdb
+      POSTGRES_REPLICATION_USER: repl_user
+      #POSTGRES_REPLICATION_PASSWORD: replpass
+      POSTGRES_REPLICATION_PASSWORD_FILE: /run/secrets/repl_password  # Add this
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-    restart: unless-stopped
+      - ~/.pgpass:/var/lib/postgresql/.pgpass:ro  # Add this line
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./conf/postgresql.conf:/var/lib/postgresql/data/postgresql.conf  # Correct path
+      - ./conf/pg_hba.conf:/var/lib/postgresql/data/pg_hba.conf          # Add this
+      - pg-archive:/var/lib/postgresql/archive
+      - ./scripts/init-replication.sh:/docker-entrypoint-initdb.d/init-replication.sh
     networks:
-      - postgres-network
+      - pg-network
+    secrets:
+      - db_password
+      - repl_password  # Add this
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d testdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    command: >
+      -c config_file=/var/lib/postgresql/data/postgresql.conf
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+      -c archive_mode=on
+      -c archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'
+      -c log_replication_commands=on
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  postgres-replica:
+    image: postgis/postgis:latest
+    container_name: pg-replica
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+      - pg-archive:/var/lib/postgresql/archive
+    networks:
+      - pg-network
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin && psql -U admin -c 'SELECT pg_is_in_recovery()' | grep -q 't'"]
+      interval: 10s
+      timeout: 15s  # Increased from 10s
+      retries: 3
+    command: >
+      postgres
+      -c hot_standby=on
+      -c primary_conninfo='user=repl_user password=$$(cat /run/secrets/repl_password) host=postgres-primary port=5432 sslmode=prefer application_name=pg-replica'
+      -c restore_command='cp /var/lib/postgresql/archive/%f %p'
+      -c recovery_target_timeline='latest'
+      -c log_replication_commands=on
+      -c log_connections=on
+    user: postgres  # Critical - runs as postgres user
+    entrypoint: |
+      bash -c '
+      until psql -h postgres-primary -U repl_user -d postgres -c "SELECT 1"; do
+        sleep 5
+      done
+
+      if [ -z "$(ls -A /var/lib/postgresql/data)" ]; then
+        pg_basebackup -h postgres-primary -U repl_user -D /var/lib/postgresql/data \
+          -P -R -X stream -d "dbname=postgres"
+      fi
+
+      exec postgres -c hot_standby=on
+      '
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 384M
 
   pgadmin:
     image: dpage/pgadmin4:latest
-    container_name: loc-pgadmin
+    container_name: pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: secret
+      PGADMIN_DEFAULT_EMAIL: marco.w.liew@gmail.com  # Change this!
+      PGADMIN_DEFAULT_PASSWORD_FILE: /run/secrets/pgadmin_password
+      #PGADMIN_DEFAULT_PASSWORD: pass  # Change this!
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin  # Persist pgAdmin data
     ports:
-      - "8080:80"
-    restart: unless-stopped
-    depends_on:
-      - postgres
+      - "5050:80"  # Access pgAdmin at http://localhost:5050
     networks:
-      - postgres-network
+      - pg-network  # Same network as PostgreSQL
+    depends_on:
+      - postgres-primary
+      #- postgres-replica
+    restart: unless-stopped
+    secrets:
+      - pgadmin_password
+
+  # postgres-exporter:
+  #   image: quay.io/prometheuscommunity/postgres-exporter
+  #   environment:
+  #     DATA_SOURCE_NAME: "postgresql://pg_exporter:securepassword@postgres:5432/postgres?sslmode=disable"
+  #   ports:
+  #     - "9187:9187"
+  #   depends_on:
+  #     - postgres
+
+  # prometheus:
+  #   image: prom/prometheus
+  #   volumes:
+  #     - ./conf/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
+  #   depends_on:
+  #     - postgres-exporter
+
+  # grafana:
+  #   image: grafana/grafana
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - prometheus
 
 volumes:
-  postgres-data:
+  pg-primary-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/volumes/pg-primary
+  pg-replica-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/volumes/pg-replica
+  pg-archive:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/volumes/pg-archive
+  pgadmin-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/volumes/pg-pgadmin
 
 networks:
-  postgres-network:
+  pg-network:
     driver: bridge
+    attachable: true
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt  # Store outside version control
+  pgadmin_password:
+    file: ./secrets/pgadmin_password.txt
+  repl_password:
+    file: ./secrets/repl_password.txt  # Add this

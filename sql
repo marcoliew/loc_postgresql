@@ -28,3 +28,34 @@ docker exec -i loc-postgres psql -U admin -d testdb -f /tmp/mydata.sql
 
 # query 
 docker exec -i loc-postgres psql -U admin -d testdb -c "SELECT * FROM employees;"
+
+# Stop services (keep data):
+docker-compose stop
+
+# Stop and delete containers (keep data):
+docker-compose down
+
+# Delete everything (including data):
+docker-compose down -v
+
+
+# Start the Services, Run this command in the same directory as your docker-compose.yml:
+
+docker-compose up -d pgadmin  # Start only pgAdmin (if other containers are running)
+# OR
+docker-compose up -d         # Recreate all containers， -d runs containers in detached mode (background).
+
+docker-compose down -v && docker-compose up -d
+
+# Verify they’re running:
+
+docker-compose ps
+
+docker-compose restart postgres-primary
+
+docker exec -it pg-primary bash
+
+
+# trouble shooting
+
+docker logs pg-primary --tail 100
